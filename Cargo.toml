@@ -1,0 +1,14 @@
+[package]
+name = "libdeflate_nrp"
+description = "DEFLATE and zlib in pure, safe Rust: a native port of libdeflate's compressor and decompressor, giving the streams libdeflate gives at its levels 0 and 2 to 9."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+repository = "https://github.com/OctoKeights/libdeflate_nrp"
+readme = "README.md"
+keywords = ["deflate", "zlib", "compression", "libdeflate", "inflate"]
+categories = ["compression"]
+
+[dependencies]
+
