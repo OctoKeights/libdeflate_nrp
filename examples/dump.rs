@@ -1,12 +1,12 @@
-//! The Rust half of the comparison with libdeflate: runs the port over made-up data and
-//! prints a running hash of what comes out, as `compare/dump_libdeflate.c` does with the original.
-//! `compare/compare.sh` compares the two.
+//! The Rust side of the comparison with libdeflate: runs libdeflate_nrp over synthetic data
+//! and prints a running hash of its output, as `compare/dump_libdeflate.c` does with
+//! libdeflate. `compare/compare.sh` compares the two.
 //!
-//!   dump libdeflate <seed> <count>   made-up data of eight kinds and many sizes, now and then
-//!                                    several pieces together, compressed into a zlib stream at
-//!                                    a level; each stream decompressed whole, into too little
-//!                                    room and into more, damaged, cut short and with bytes after
-//!                                    it; and made-up bytes after a zlib header decompressed
+//!   dump libdeflate <seed> <count>   synthetic data of eight kinds and many sizes, sometimes
+//!                                    several pieces joined, compressed to a zlib stream at a
+//!                                    level; each stream decompressed intact, into too little
+//!                                    room and into more, damaged, truncated and with bytes
+//!                                    after it; and random bytes after a zlib header
 
 #[path = "../tests/made_up/mod.rs"]
 mod made_up;

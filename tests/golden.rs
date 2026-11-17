@@ -1,10 +1,10 @@
-//! The port of libdeflate against results recorded from the original, so that a change shows
-//! without a C compiler at hand.
+//! libdeflate_nrp against hashes recorded from libdeflate, so that any change in output shows
+//! without a C compiler.
 //!
 //! `tests/data/libdeflate_expected.txt` is what `compare/dump_libdeflate.c`, built against
-//! libdeflate (see `compare/compare.sh`), prints for `libdeflate 3 200` and `libdeflate 8 200`:
-//! a hash of what made-up data compresses to at each level, and of what each stream, whole and
-//! damaged, decompresses to or is refused with. `compare/compare.sh` is the full comparison.
+//! libdeflate 1.26, prints for `libdeflate 3 200` and `libdeflate 8 200`: hashes of synthetic
+//! data compressed at each level, and of what each stream decompresses to, intact and damaged,
+//! or the error it gives. `compare/compare.sh` runs the full comparison.
 
 mod made_up;
 

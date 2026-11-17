@@ -1,13 +1,13 @@
-/* The C half of the comparison with libdeflate (https://github.com/ebiggers/libdeflate) v1.26:
-   compresses made-up data at its levels 0 and 2 to 9 into zlib streams, decompresses them and
-   damaged copies of them, and prints a running hash of what comes out. examples/dump.rs prints
-   the same from the Rust port, and compare/compare.sh compares the two.
+/* The C side of the comparison with libdeflate (https://github.com/ebiggers/libdeflate) v1.26:
+   compresses synthetic data at levels 0 and 2 to 9 into zlib streams, decompresses them and
+   damaged copies of them, and prints a running hash of the output. examples/dump.rs prints
+   the same from libdeflate_nrp, and compare/compare.sh compares the two.
 
-     dump libdeflate <seed> <count>   made-up data of eight kinds and many sizes, now and then
-                                      several pieces together, compressed at a level; each
-                                      stream decompressed whole, into too little room and
-                                      into more, damaged, cut short and with bytes after it;
-                                      and made-up bytes after a zlib header decompressed */
+     dump libdeflate <seed> <count>   synthetic data of eight kinds and many sizes, sometimes
+                                      several pieces joined, compressed to a zlib stream at a
+                                      level; each stream decompressed intact, into too little
+                                      room and into more, damaged, truncated and with bytes
+                                      after it; and random bytes after a zlib header */
 #include "libdeflate.h"
 
 #include <stdint.h>

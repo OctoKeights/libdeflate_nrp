@@ -1,5 +1,6 @@
-//! Made-up data, the same from a seed here as in the C side of the comparison
-//! (`compare/`), and the dumps the tests run as well as the comparison (`examples/dump.rs`).
+//! Synthetic data, generated from a seed exactly as the C side of the comparison
+//! (`compare/dump_libdeflate.c`) generates it, and the dump that both the golden tests and
+//! `examples/dump.rs` run.
 
 // (The arithmetic is written as the C side has it; not every user of this module uses all of
 // it.)
@@ -151,8 +152,8 @@ pub fn make_data(r: &mut Random) -> Vec<u8> {
 /// libdeflate's, and the streams (and damaged copies, and made-up bytes after a zlib header)
 /// decompressed, as `compare/dump_libdeflate.c` does with libdeflate itself.
 pub fn libdeflate(seed: u64, count: u32) -> String {
-    use libdeflate_nrp::{Error, zlib_compress, zlib_decompress};
-    const LEVELS: [i32; 10] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 4];
+    use libdeflate_nrp::{Decompressed, Error, Level, zlib_compress, zlib_decompress};
+    const LEVELS: [u8; 10] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 4];
     let mut r = Random { state: seed };
     let mut hash = Hash::new();
     let mut total = 0u64;
@@ -163,7 +164,10 @@ pub fn libdeflate(seed: u64, count: u32) -> String {
         // 0 for done, when the stream ends where the input does, and the bytes made; 1 for a
         // stream that is not one or does not end there; 2 for one that makes too many bytes.
         match zlib_decompress(input, &mut out) {
-            Ok((taken, made)) if taken == input.len() => {
+            Ok(Decompressed {
+                bytes_read,
+                bytes_written: made,
+            }) if bytes_read == input.len() => {
                 hash.add(&0u32.to_le_bytes());
                 hash.add(&(made as u32).to_le_bytes());
                 hash.add(&out[..made]);
@@ -181,11 +185,11 @@ pub fn libdeflate(seed: u64, count: u32) -> String {
             }
         }
         let level = LEVELS[(r.next() % 10) as usize];
-        let mut stream = zlib_compress(level, &data);
+        let mut stream = zlib_compress(&data, Level::new(level).expect("a ported level"));
         let size = stream.len();
         total += data.len() as u64;
         add_number(&mut hash, data.len() as u32);
-        add_number(&mut hash, level as u32);
+        add_number(&mut hash, u32::from(level));
         add_number(&mut hash, size as u32);
         hash.add(&stream);
 

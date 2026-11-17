@@ -3,11 +3,11 @@
 #
 #   compare/compare.sh <checkout of libdeflate> [count] [seeds] [dumps]
 #
-# (OpenEXR 3.5's external/deflate is the same libdeflate, and does as well.)
-# compare/dump_libdeflate.c is built against libdeflate's library, and examples/dump.rs from
-# the port; both run the same made-up data for each seed and what they print is compared byte
-# for byte. Dump: libdeflate, with a hundredth of [count] (200,000 by default) as the number of
-# made-up sources, each compressed at a level and decompressed whole and damaged.
+# OpenEXR 3.5's external/deflate is the same libdeflate and works too. compare/dump_libdeflate.c
+# is built against libdeflate and examples/dump.rs against libdeflate_nrp. Both run the same
+# synthetic data for each seed, and their output is compared byte for byte. The libdeflate dump
+# runs a hundredth of [count] (200,000 by default) sources, each compressed at a level and
+# decompressed intact and damaged.
 set -u
 if [ $# -lt 1 ]; then
     echo "usage: $0 <checkout of libdeflate> [count] [seeds] [dumps]" >&2
