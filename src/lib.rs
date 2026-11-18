@@ -27,7 +27,7 @@
 //!
 //! Other DEFLATE compressors, such as zlib's or miniz's, produce different (equally valid)
 //! streams from the same data; libdeflate's are reproduced here because some formats, such as
-//! `OpenEXR`'s DWA compression, store them.
+//! OpenEXR's DWA compression, store them.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
