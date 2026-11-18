@@ -2,15 +2,8 @@
 //! (`compare/dump_libdeflate.c`) generates it, and the dump that both the golden tests and
 //! `examples/dump.rs` run.
 
-// (The arithmetic is written as the C side has it; not every user of this module uses all of
-// it.)
-#![allow(
-    clippy::manual_is_multiple_of,
-    clippy::needless_range_loop,
-    clippy::manual_div_ceil,
-    clippy::manual_checked_ops,
-    dead_code
-)]
+// (The golden tests and the dump each use only part of this module.)
+#![allow(dead_code)]
 
 use std::fmt::Write;
 /// The two programs make the same blocks from the same seed: a 64-bit linear congruential
@@ -108,7 +101,7 @@ pub fn make_data(r: &mut Random) -> Vec<u8> {
         // copies of what came before
         4 => {
             while buf.len() < len {
-                if buf.len() < 64 || r.next() % 4 == 0 {
+                if buf.len() < 64 || r.next().is_multiple_of(4) {
                     buf.push((r.next() >> 9) as u8);
                 } else {
                     let reach = buf.len().min(40000);
@@ -228,7 +221,7 @@ pub fn libdeflate(seed: u64, count: u32) -> String {
             for _ in 2..n {
                 bytes.push((r.next() >> 7) as u8);
             }
-            if r.next() % 2 != 0 {
+            if !r.next().is_multiple_of(2) {
                 bytes[2] = (bytes[2] & !7) | 1 | (((r.next() % 3) as u8) << 1);
             }
             let room = (r.next() % 3000) as usize;
