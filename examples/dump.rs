@@ -1,4 +1,4 @@
-//! The Rust side of the comparison with libdeflate: runs libdeflate_nrp over synthetic data
+//! The Rust side of the comparison with libdeflate: runs `libdeflate_nrp` over synthetic data
 //! and prints a running hash of its output, as `compare/dump_libdeflate.c` does with
 //! libdeflate. `compare/compare.sh` compares the two.
 //!
@@ -22,11 +22,10 @@ fn main() {
         std::process::exit(2);
     };
     let _ = seed;
-    match what.as_str() {
-        "libdeflate" => print!("{}", made_up::libdeflate(seed, count)),
-        _ => {
-            eprintln!("unknown dump {what}");
-            std::process::exit(2);
-        }
+    if what.as_str() == "libdeflate" {
+        print!("{}", made_up::libdeflate(seed, count));
+    } else {
+        eprintln!("unknown dump {what}");
+        std::process::exit(2);
     }
 }

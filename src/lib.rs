@@ -27,7 +27,7 @@
 //!
 //! Other DEFLATE compressors, such as zlib's or miniz's, produce different (equally valid)
 //! streams from the same data; libdeflate's are reproduced here because some formats, such as
-//! OpenEXR's DWA compression, store them.
+//! `OpenEXR`'s DWA compression, store them.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -59,6 +59,7 @@ impl Level {
     pub const BEST: Level = Level(9);
 
     /// The level `level`, if it is 0 or 2 to 9.
+    #[must_use]
     pub const fn new(level: u8) -> Option<Level> {
         match level {
             0 | 2..=9 => Some(Level(level)),
@@ -67,6 +68,7 @@ impl Level {
     }
 
     /// The level as a number.
+    #[must_use]
     pub const fn get(self) -> u8 {
         self.0
     }

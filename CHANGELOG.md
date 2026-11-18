@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1
+
+- **Stricter lints, enforced in CI.** `Cargo.toml` turns on clippy's pedantic group for every
+  target, and forbids `unsafe` code in the tests, examples and benchmarks as well as the
+  library. Functions whose result should not be ignored are marked `#[must_use]`, and the
+  decompressors document their errors.
+
+- **Tidier internals.** The compressor's match limits, which shrink near the end of the
+  input, are a small type of their own rather than two values passed by mutable reference.
+
+- Output is unchanged, checked against libdeflate on 30,000 sources (953 MB), and so is
+  speed: the same number of instructions are executed.
+
 ## 0.2.0
 
 - **Breaking: an idiomatic API.** Compression levels are a `Level` type that holds only

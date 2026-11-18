@@ -72,7 +72,7 @@ fn offset_slot(offset: u32) -> usize {
         n as usize
     } else {
         // Two slots per power of two: the top bit's position, and the bit below it.
-        let top = 31 - n.leading_zeros();
+        let top = n.ilog2();
         (2 * top + ((n >> (top - 1)) & 1)) as usize
     }
 }
@@ -274,10 +274,9 @@ impl Codes {
         let mut freqs = Frequencies::default();
         for (symbol, freq) in freqs.litlen.iter_mut().enumerate() {
             let len = match symbol {
-                0..=143 => 8,
                 144..=255 => 9,
                 256..=279 => 7,
-                _ => 8,
+                _ => 8, // 0 to 143, and 280 to 287
             };
             *freq = 1 << (9 - len);
         }
@@ -367,11 +366,51 @@ struct HashChains {
     next_hash4: u32,
 }
 
+/// The lengths matches may have, which shrink near the end of the input and stay shrunk, so
+/// that no match reaches past it.
+#[derive(Clone, Copy)]
+struct MatchLimits {
+    /// The longest match allowed.
+    max_len: u32,
+    /// A match this long ends a search.
+    nice_len: u32,
+}
+
+impl MatchLimits {
+    fn new(nice_len: u32) -> Self {
+        Self {
+            max_len: MAX_MATCH_LEN,
+            nice_len: nice_len.min(MAX_MATCH_LEN),
+        }
+    }
+
+    /// Shrinks the limits so that no match from a position `remaining` bytes from the end
+    /// reaches past it.
+    fn shrink_near_end(&mut self, remaining: usize) {
+        if remaining < MAX_MATCH_LEN as usize {
+            self.max_len = remaining as u32;
+            self.nice_len = self.nice_len.min(self.max_len);
+        }
+    }
+
+    /// A search within these limits for a match longer than `min_beat`, following at most
+    /// `max_depth` chain links.
+    fn search(self, min_beat: u32, max_depth: u32) -> Search {
+        Search {
+            min_beat,
+            max_len: self.max_len,
+            nice_len: self.nice_len,
+            max_depth,
+        }
+    }
+}
+
 /// The bounds of one search.
 #[derive(Clone, Copy)]
 struct Search {
     /// Only matches longer than this are of interest.
     min_beat: u32,
+    /// The longest match allowed.
     max_len: u32,
     /// A match this long ends the search.
     nice_len: u32,
@@ -759,9 +798,7 @@ impl Compressor {
     fn compress(&mut self, input: &[u8], output: &mut BitWriter) {
         let end = input.len();
         let mut pos = 0;
-        // Matches may not reach past the end; these shrink near it and stay shrunk.
-        let mut max_len = MAX_MATCH_LEN;
-        let mut nice_len = self.nice_match_len.min(max_len);
+        let mut limits = MatchLimits::new(self.nice_match_len);
         loop {
             let block_start = pos;
             let block_limit = if end - pos < SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH {
@@ -779,11 +816,9 @@ impl Compressor {
                     next_min_len_update += (end - next_min_len_update).min(pos - block_start);
                 }
                 pos = match self.parser {
-                    Parser::Greedy => {
-                        self.parse_greedy(input, pos, min_len, &mut max_len, &mut nice_len)
-                    }
+                    Parser::Greedy => self.parse_greedy(input, pos, min_len, &mut limits),
                     Parser::Lazy | Parser::Lazy2 => {
-                        self.parse_lazy(input, pos, min_len, &mut max_len, &mut nice_len)
+                        self.parse_lazy(input, pos, min_len, &mut limits)
                     }
                 };
                 let block_full = pos >= block_limit || self.current >= MAX_SEQUENCES;
@@ -805,15 +840,6 @@ impl Compressor {
         self.freqs = Frequencies::default();
     }
 
-    fn search(&self, min_beat: u32, max_len: u32, nice_len: u32, max_depth: u32) -> Search {
-        Search {
-            min_beat,
-            max_len,
-            nice_len,
-            max_depth,
-        }
-    }
-
     /// One step of greedy parsing at `pos`: the longest match, or a literal. Returns the next
     /// position.
     fn parse_greedy(
@@ -821,11 +847,10 @@ impl Compressor {
         input: &[u8],
         pos: usize,
         min_len: u32,
-        max_len: &mut u32,
-        nice_len: &mut u32,
+        limits: &mut MatchLimits,
     ) -> usize {
-        shrink_near_end(max_len, nice_len, input.len() - pos);
-        let search = self.search(min_len - 1, *max_len, *nice_len, self.max_search_depth);
+        limits.shrink_near_end(input.len() - pos);
+        let search = limits.search(min_len - 1, self.max_search_depth);
         let (length, offset) = self.chains.longest_match(input, pos, search);
         if length >= min_len && (length > MIN_MATCH_LEN || offset <= 4096) {
             self.choose_match(length, offset);
@@ -844,12 +869,11 @@ impl Compressor {
         input: &[u8],
         mut pos: usize,
         min_len: u32,
-        max_len: &mut u32,
-        nice_len: &mut u32,
+        limits: &mut MatchLimits,
     ) -> usize {
         let end = input.len();
-        shrink_near_end(max_len, nice_len, end - pos);
-        let search = self.search(min_len - 1, *max_len, *nice_len, self.max_search_depth);
+        limits.shrink_near_end(end - pos);
+        let search = limits.search(min_len - 1, self.max_search_depth);
         let (mut cur_len, mut cur_offset) = self.chains.longest_match(input, pos, search);
         if cur_len < min_len || (cur_len == MIN_MATCH_LEN && cur_offset > 8192) {
             self.choose_literal(input[pos]);
@@ -864,14 +888,14 @@ impl Compressor {
                 && 4 * (len - cur_len) as i32 + (log2(cur_offset) - log2(offset)) > margin
         };
         loop {
-            if cur_len >= *nice_len {
+            if cur_len >= limits.nice_len {
                 self.choose_match(cur_len, cur_offset);
                 self.chains.skip(input, pos, cur_len - 1);
                 return pos + cur_len as usize - 1;
             }
 
-            shrink_near_end(max_len, nice_len, end - pos);
-            let search = self.search(cur_len - 1, *max_len, *nice_len, self.max_search_depth >> 1);
+            limits.shrink_near_end(end - pos);
+            let search = limits.search(cur_len - 1, self.max_search_depth >> 1);
             let (next_len, next_offset) = self.chains.longest_match(input, pos, search);
             pos += 1;
             if beats(next_len, next_offset, cur_len, cur_offset, 2) {
@@ -886,8 +910,8 @@ impl Compressor {
                 return pos + cur_len as usize - 2;
             }
 
-            shrink_near_end(max_len, nice_len, end - pos);
-            let search = self.search(cur_len - 1, *max_len, *nice_len, self.max_search_depth >> 2);
+            limits.shrink_near_end(end - pos);
+            let search = limits.search(cur_len - 1, self.max_search_depth >> 2);
             let (next_len, next_offset) = self.chains.longest_match(input, pos, search);
             pos += 1;
             if beats(next_len, next_offset, cur_len, cur_offset, 6) {
@@ -1137,15 +1161,6 @@ impl Compressor {
     }
 }
 
-/// Shrinks the longest match allowed, and the length that ends a search, so that no match
-/// reaches past the end of the input.
-fn shrink_near_end(max_len: &mut u32, nice_len: &mut u32, remaining: usize) {
-    if remaining < MAX_MATCH_LEN as usize {
-        *max_len = remaining as u32;
-        *nice_len = (*nice_len).min(*max_len);
-    }
-}
-
 /// Writes `data` as stored blocks of at most 65535 bytes, after the bits already pending.
 fn write_stored_blocks(output: &mut BitWriter, data: &[u8], is_final: bool) {
     let count = data.len().div_ceil(MAX_STORED_LEN).max(1);
@@ -1203,6 +1218,7 @@ fn deflate_into(input: &[u8], level: Level, output: Vec<u8>) -> Vec<u8> {
 
 /// The largest raw DEFLATE stream [`deflate_compress`] can produce from `len` bytes, at any
 /// level (`libdeflate_deflate_compress_bound`).
+#[must_use]
 pub fn deflate_compress_bound(len: usize) -> usize {
     // Five bytes for each stored block (at least one), and the data.
     let max_blocks = len.div_ceil(MIN_BLOCK_LENGTH).max(1);
@@ -1211,18 +1227,21 @@ pub fn deflate_compress_bound(len: usize) -> usize {
 
 /// The largest zlib stream [`zlib_compress`] can produce from `len` bytes, at any level
 /// (`libdeflate_zlib_compress_bound`).
+#[must_use]
 pub fn zlib_compress_bound(len: usize) -> usize {
     // A 2-byte header and a 4-byte checksum.
     deflate_compress_bound(len).saturating_add(2 + 4)
 }
 
 /// Compresses `input` to a raw DEFLATE stream at `level` (`libdeflate_deflate_compress`).
+#[must_use]
 pub fn deflate_compress(input: &[u8], level: Level) -> Vec<u8> {
     deflate_into(input, level, Vec::new())
 }
 
 /// Compresses `input` to a zlib stream at `level` (`libdeflate_zlib_compress`): a 2-byte
 /// header, the raw DEFLATE stream, and the Adler-32 checksum of `input`.
+#[must_use]
 pub fn zlib_compress(input: &[u8], level: Level) -> Vec<u8> {
     let level_hint: u16 = match level.get() {
         0..2 => 0,
@@ -1270,8 +1289,8 @@ mod tests {
         let data: Vec<u8> = (0..200_000u32)
             .map(|i| {
                 state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 if i % 1000 < 600 {
                     (i / 7 % 13) as u8
                 } else {

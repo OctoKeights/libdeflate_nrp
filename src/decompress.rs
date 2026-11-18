@@ -267,6 +267,11 @@ impl<'a> BitReader<'a> {
 ///
 /// Input after the end of the stream is ignored; [`Decompressed::bytes_read`] says where it
 /// ended.
+///
+/// # Errors
+///
+/// [`Error::BadData`] if the input is not a valid stream, and [`Error::InsufficientSpace`] if
+/// it decompresses to more than `output` holds.
 pub fn deflate_decompress(input: &[u8], output: &mut [u8]) -> Result<Decompressed, Error> {
     let mut bits = BitReader::new(input);
     let mut written = 0;
@@ -424,11 +429,13 @@ fn decode_huffman_block(
 }
 
 /// The Adler-32 checksum of `data`, as zlib streams end with (`libdeflate_adler32` from 1).
+#[must_use]
 pub fn adler32(data: &[u8]) -> u32 {
     adler32_update(1, data)
 }
 
 /// Continues the Adler-32 checksum `adler` over `data` (`libdeflate_adler32`).
+#[must_use]
 pub fn adler32_update(adler: u32, data: &[u8]) -> u32 {
     const MODULUS: u32 = 65521;
     // The most bytes that can be summed before the sums might overflow.
@@ -450,6 +457,12 @@ pub fn adler32_update(adler: u32, data: &[u8]) -> u32 {
 ///
 /// Input after the end of the stream is ignored; [`Decompressed::bytes_read`] says where it
 /// ended.
+///
+/// # Errors
+///
+/// [`Error::BadData`] if the input is not a valid zlib stream (a bad header, or a checksum
+/// that does not match), and [`Error::InsufficientSpace`] if it decompresses to more than
+/// `output` holds.
 pub fn zlib_decompress(input: &[u8], output: &mut [u8]) -> Result<Decompressed, Error> {
     const HEADER: usize = 2;
     const TRAILER: usize = 4;

@@ -12,6 +12,7 @@
     dead_code
 )]
 
+use std::fmt::Write;
 /// The two programs make the same blocks from the same seed: a 64-bit linear congruential
 /// generator, the high half of its state.
 pub struct Random {
@@ -22,8 +23,8 @@ impl Random {
     pub fn next(&mut self) -> u32 {
         self.state = self
             .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (self.state >> 32) as u32
     }
 }
@@ -36,14 +37,14 @@ pub struct Hash {
 impl Hash {
     pub fn new() -> Hash {
         Hash {
-            value: 14695981039346656037,
+            value: 14_695_981_039_346_656_037,
         }
     }
 
     pub fn add(&mut self, data: &[u8]) {
         for &byte in data {
             self.value ^= u64::from(byte);
-            self.value = self.value.wrapping_mul(1099511628211);
+            self.value = self.value.wrapping_mul(1_099_511_628_211);
         }
     }
 }
@@ -61,7 +62,7 @@ pub fn make_data(r: &mut Random) -> Vec<u8> {
         2 | 3 => r.next() % 5000,
         4 | 5 => r.next() % 40000,
         6 => 60000 + r.next() % 20000,
-        _ => r.next() % 200000,
+        _ => r.next() % 200_000,
     } as usize;
     let kind = r.next() % 8;
     let mut buf = Vec::with_capacity(len);
@@ -148,17 +149,12 @@ pub fn make_data(r: &mut Random) -> Vec<u8> {
     buf
 }
 
-/// The `libdeflate` dump: made-up data compressed into zlib streams at a level of
-/// libdeflate's, and the streams (and damaged copies, and made-up bytes after a zlib header)
+/// The `libdeflate` dump: synthetic data compressed into zlib streams at a level of
+/// libdeflate's, and the streams (and damaged copies, and random bytes after a zlib header)
 /// decompressed, as `compare/dump_libdeflate.c` does with libdeflate itself.
 pub fn libdeflate(seed: u64, count: u32) -> String {
     use libdeflate_nrp::{Decompressed, Error, Level, zlib_compress, zlib_decompress};
     const LEVELS: [u8; 10] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 4];
-    let mut r = Random { state: seed };
-    let mut hash = Hash::new();
-    let mut total = 0u64;
-    let mut out = String::new();
-    let add_number = |hash: &mut Hash, value: u32| hash.add(&value.to_le_bytes());
     fn add_uncompress(hash: &mut Hash, input: &[u8], room: usize) {
         let mut out = vec![0u8; room];
         // 0 for done, when the stream ends where the input does, and the bytes made; 1 for a
@@ -176,6 +172,11 @@ pub fn libdeflate(seed: u64, count: u32) -> String {
             Err(Error::InsufficientSpace) => hash.add(&2u32.to_le_bytes()),
         }
     }
+    let mut r = Random { state: seed };
+    let mut hash = Hash::new();
+    let mut total = 0u64;
+    let mut out = String::new();
+    let add_number = |hash: &mut Hash, value: u32| hash.add(&value.to_le_bytes());
     for round in 0..count {
         let mut data = make_data(&mut r);
         if r.next().is_multiple_of(8) {
@@ -235,7 +236,7 @@ pub fn libdeflate(seed: u64, count: u32) -> String {
         }
 
         if (round + 1) % 200 == 0 || round + 1 == count {
-            out += &format!("libdeflate {} {:016x}\n", round + 1, hash.value);
+            writeln!(out, "libdeflate {} {:016x}", round + 1, hash.value).unwrap();
         }
     }
     out + &format!("libdeflate bytes: {total}\n")

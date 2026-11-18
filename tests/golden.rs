@@ -1,4 +1,4 @@
-//! libdeflate_nrp against hashes recorded from libdeflate, so that any change in output shows
+//! `libdeflate_nrp` against hashes recorded from libdeflate, so that any change in output shows
 //! without a C compiler.
 //!
 //! `tests/data/libdeflate_expected.txt` is what `compare/dump_libdeflate.c`, built against
