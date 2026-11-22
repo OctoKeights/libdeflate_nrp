@@ -1,12 +1,15 @@
-//! The compressor: libdeflate's `deflate_compress.c` (with `hc_matchfinder.h` and
-//! `matchfinder_common.h`) and `zlib_compress.c`, for levels 0 and 2 to 9.
+//! The compressor: libdeflate's `deflate_compress.c` (with `hc_matchfinder.h`,
+//! `ht_matchfinder.h`, and `matchfinder_common.h`), `zlib_compress.c`, and `gzip_compress.c`.
 //!
-//! Level 0 stores the data. Levels 2 to 9 find matches in hash chains and choose between
-//! them greedily (2 to 4), lazily (5 to 7) or looking two positions ahead (8 and 9), ending
-//! blocks where the data's statistics change and writing each as whichever kind of block is
-//! smallest.
+//! Level 0 stores the data. Level 1 finds 4-byte matches in a compact hash table. Levels 2 to
+//! 9 find matches in hash chains and choose between them greedily (2 to 4), lazily (5 to 7),
+//! or looking two positions ahead (8 and 9), ending blocks where the data's statistics change
+//! and writing each as whichever kind of block is smallest.
 
-use crate::{Level, adler32};
+use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::{Error, Level, adler32, crc32};
 
 const MIN_MATCH_LEN: u32 = 3;
 const MAX_MATCH_LEN: u32 = 258;
@@ -16,6 +19,7 @@ const NUM_PRECODE_SYMS: usize = 19;
 const NUM_LITERALS: usize = 256;
 const END_OF_BLOCK: usize = 256;
 const FIRST_LENGTH_SYM: usize = 257;
+const MAX_HEADER_LENS: usize = NUM_LITLEN_SYMS + NUM_OFFSET_SYMS;
 
 const MIN_BLOCK_LENGTH: usize = 5000;
 const SOFT_MAX_BLOCK_LENGTH: usize = 300_000;
@@ -66,14 +70,14 @@ const LENGTH_SLOTS: [u8; MAX_MATCH_LEN as usize + 1] = {
 
 /// The offset slot of a match offset, 1 to 32768.
 #[inline]
-fn offset_slot(offset: u32) -> usize {
+fn offset_slot(offset: u32) -> u8 {
     let n = offset - 1;
     if n < 4 {
-        n as usize
+        n as u8
     } else {
         // Two slots per power of two: the top bit's position, and the bit below it.
         let top = n.ilog2();
-        (2 * top + ((n >> (top - 1)) & 1)) as usize
+        (2 * top + ((n >> (top - 1)) & 1)) as u8
     }
 }
 
@@ -81,7 +85,7 @@ fn offset_slot(offset: u32) -> usize {
 // Huffman codes
 
 /// Sorting and tree building pack a symbol into the low bits of each entry and a frequency,
-/// parent index or depth into the high bits.
+/// parent index, or depth into the high bits.
 const SYMBOL_BITS: u32 = 10;
 const SYMBOL_MASK: u32 = (1 << SYMBOL_BITS) - 1;
 const VALUE_MASK: u32 = !SYMBOL_MASK;
@@ -224,25 +228,65 @@ fn make_huffman_code(max_len: u32, freqs: &[u32], lens: &mut [u8], codewords: &m
 
 /// The two codes of a block. Their lengths share one array, literal/length code first, as
 /// the block header writes them.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Codes {
     litlen_codewords: [u32; NUM_LITLEN_SYMS],
     offset_codewords: [u32; NUM_OFFSET_SYMS],
-    lens: [u8; NUM_LITLEN_SYMS + NUM_OFFSET_SYMS],
+    lens: [u8; MAX_HEADER_LENS],
 }
+
+/// Precomputed fixed Huffman codes for static blocks (RFC 1951 Section 3.2.6).
+const FIXED_CODES: Codes = {
+    let mut lens = [0u8; MAX_HEADER_LENS];
+    let mut litlen_codewords = [0u32; NUM_LITLEN_SYMS];
+    let mut offset_codewords = [0u32; NUM_OFFSET_SYMS];
+
+    let mut counts = [0u32; 16];
+    counts[7] = 24;
+    counts[8] = 152;
+    counts[9] = 112;
+
+    let mut next = [0u32; 16];
+    let mut len = 2;
+    while len <= 9 {
+        next[len] = (next[len - 1] + counts[len - 1]) << 1;
+        len += 1;
+    }
+
+    let mut sym = 0;
+    while sym < NUM_LITLEN_SYMS {
+        let bit_len: u8 = match sym {
+            144..=255 => 9,
+            256..=279 => 7,
+            _ => 8,
+        };
+        lens[sym] = bit_len;
+        let code = next[bit_len as usize];
+        next[bit_len as usize] += 1;
+        litlen_codewords[sym] = code.reverse_bits() >> (32 - bit_len as u32);
+        sym += 1;
+    }
+
+    let mut slot = 0;
+    while slot < NUM_OFFSET_SYMS {
+        lens[NUM_LITLEN_SYMS + slot] = 5;
+        offset_codewords[slot] = (slot as u32).reverse_bits() >> (32 - 5);
+        slot += 1;
+    }
+
+    Codes {
+        litlen_codewords,
+        offset_codewords,
+        lens,
+    }
+};
 
 impl Codes {
     const EMPTY: Codes = Codes {
         litlen_codewords: [0; NUM_LITLEN_SYMS],
         offset_codewords: [0; NUM_OFFSET_SYMS],
-        lens: [0; NUM_LITLEN_SYMS + NUM_OFFSET_SYMS],
+        lens: [0; MAX_HEADER_LENS],
     };
-
-    fn build(freqs: &Frequencies) -> Codes {
-        let mut codes = Codes::EMPTY;
-        codes.rebuild(freqs);
-        codes
-    }
 
     fn rebuild(&mut self, freqs: &Frequencies) {
         let (litlen_lens, offset_lens) = self.lens.split_at_mut(NUM_LITLEN_SYMS);
@@ -260,28 +304,14 @@ impl Codes {
         );
     }
 
+    #[inline]
     fn litlen_len(&self, symbol: usize) -> u32 {
         u32::from(self.lens[symbol])
     }
 
+    #[inline]
     fn offset_len(&self, slot: usize) -> u32 {
         u32::from(self.lens[NUM_LITLEN_SYMS + slot])
-    }
-
-    /// The fixed codes of a static block, as libdeflate builds them: from frequencies that
-    /// give the format's codeword lengths.
-    fn fixed() -> Codes {
-        let mut freqs = Frequencies::default();
-        for (symbol, freq) in freqs.litlen.iter_mut().enumerate() {
-            let len = match symbol {
-                144..=255 => 9,
-                256..=279 => 7,
-                _ => 8, // 0 to 143, and 280 to 287
-            };
-            *freq = 1 << (9 - len);
-        }
-        freqs.offset = [1; NUM_OFFSET_SYMS];
-        Codes::build(&freqs)
     }
 }
 
@@ -304,51 +334,158 @@ impl Default for Frequencies {
 // ----------------------------------------------------------------------------------------
 // Output
 
+trait ByteSink {
+    type Error;
+
+    fn push(&mut self, byte: u8) -> Result<(), Self::Error>;
+    fn extend(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+
+impl ByteSink for Vec<u8> {
+    type Error = core::convert::Infallible;
+
+    #[inline]
+    fn push(&mut self, byte: u8) -> Result<(), Self::Error> {
+        Vec::push(self, byte);
+        Ok(())
+    }
+
+    #[inline]
+    fn extend(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        Vec::extend_from_slice(self, bytes);
+        Ok(())
+    }
+}
+
+struct SliceSink<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> SliceSink<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+}
+
+impl ByteSink for SliceSink<'_> {
+    type Error = Error;
+
+    #[inline]
+    fn push(&mut self, byte: u8) -> Result<(), Self::Error> {
+        *self.buf.get_mut(self.pos).ok_or(Error::InsufficientSpace)? = byte;
+        self.pos += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn extend(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        let end = self
+            .pos
+            .checked_add(bytes.len())
+            .ok_or(Error::InsufficientSpace)?;
+        let dst = self
+            .buf
+            .get_mut(self.pos..end)
+            .ok_or(Error::InsufficientSpace)?;
+        dst.copy_from_slice(bytes);
+        self.pos = end;
+        Ok(())
+    }
+}
+
 /// Writes bits least significant first, a byte at a time.
-struct BitWriter {
-    bytes: Vec<u8>,
+struct BitWriter<S> {
+    sink: S,
     buffer: u64,
     count: u32,
 }
 
-impl BitWriter {
-    fn new(bytes: Vec<u8>) -> Self {
+impl<S: ByteSink> BitWriter<S> {
+    fn new(sink: S) -> Self {
         BitWriter {
-            bytes,
+            sink,
             buffer: 0,
             count: 0,
         }
     }
 
     #[inline]
-    fn write(&mut self, bits: u32, n: u32) {
+    fn write(&mut self, bits: u32, n: u32) -> Result<(), S::Error> {
         self.buffer |= u64::from(bits) << self.count;
         self.count += n;
         while self.count >= 8 {
-            self.bytes.push(self.buffer as u8);
+            self.sink.push(self.buffer as u8)?;
             self.buffer >>= 8;
             self.count -= 8;
         }
+        Ok(())
     }
 
     /// Writes the remaining bits, padded with zeros to a byte.
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(mut self) -> Result<S, S::Error> {
         if self.count != 0 {
-            self.bytes.push(self.buffer as u8);
+            self.sink.push(self.buffer as u8)?;
         }
-        self.bytes
+        Ok(self.sink)
     }
 }
 
 // ----------------------------------------------------------------------------------------
-// Hash chains
+// Matchfinders
 
 /// The match finder's window: matches reach back at most this far.
 const WINDOW_SIZE: usize = 1 << 15;
+const HT_HASH_BITS: u32 = 14;
 const HASH3_BITS: u32 = 15;
 const HASH4_BITS: u32 = 16;
 /// A chain link that points nowhere: before the start of the window.
 const NO_POSITION: i16 = i16::MIN;
+
+/// Compact two-way hash table (`ht_matchfinder`) for level 1.
+struct FastHashTable {
+    entries: Vec<[i16; 2]>,
+    base: usize,
+    dirty: bool,
+}
+
+impl FastHashTable {
+    fn new() -> Self {
+        Self {
+            entries: vec![[NO_POSITION; 2]; 1 << HT_HASH_BITS],
+            base: 0,
+            dirty: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        if self.dirty {
+            self.entries.fill([NO_POSITION; 2]);
+            self.base = 0;
+            self.dirty = false;
+        }
+    }
+
+    #[inline]
+    fn relative(&mut self, pos: usize) -> usize {
+        if pos - self.base >= WINDOW_SIZE {
+            for bucket in &mut self.entries {
+                bucket[0] = NO_POSITION | (bucket[0] & !(bucket[0] >> 15));
+                bucket[1] = NO_POSITION | (bucket[1] & !(bucket[1] >> 15));
+            }
+            self.base += WINDOW_SIZE;
+        }
+        pos - self.base
+    }
+
+    #[inline]
+    fn insert(&mut self, input: &[u8], pos: usize) {
+        let cur = self.relative(pos);
+        let h = hash(load_u32(input, pos), HT_HASH_BITS) as usize;
+        let prev = self.entries[h][0];
+        self.entries[h] = [cur as i16, prev];
+    }
+}
 
 /// Hash chains over the input (`hc_matchfinder`): for the latest position of every 3-byte
 /// and 4-byte hash, and from each position to the previous one with the same 4-byte hash.
@@ -364,6 +501,7 @@ struct HashChains {
     /// The hashes of the next position, computed one step ahead.
     next_hash3: u32,
     next_hash4: u32,
+    dirty: bool,
 }
 
 /// The lengths matches may have, which shrink near the end of the input and stay shrunk, so
@@ -432,11 +570,19 @@ fn load_u32(input: &[u8], at: usize) -> u32 {
 #[inline]
 fn match_len(input: &[u8], a: usize, b: usize, start_len: u32, max_len: u32) -> u32 {
     let (start, max) = (start_len as usize, max_len as usize);
-    let same = input[a + start..a + max]
-        .iter()
-        .zip(&input[b + start..b + max])
-        .take_while(|(x, y)| x == y)
-        .count();
+    let xs = &input[a + start..a + max];
+    let ys = &input[b + start..b + max];
+    let mut same = 0usize;
+    let (x_chunks, x_rem) = xs.as_chunks::<8>();
+    let (y_chunks, y_rem) = ys.as_chunks::<8>();
+    for (&xc, &yc) in x_chunks.iter().zip(y_chunks) {
+        let diff = u64::from_le_bytes(xc) ^ u64::from_le_bytes(yc);
+        if diff != 0 {
+            return start_len + same as u32 + (diff.trailing_zeros() >> 3);
+        }
+        same += 8;
+    }
+    same += x_rem.iter().zip(y_rem).take_while(|(x, y)| x == y).count();
     start_len + same as u32
 }
 
@@ -458,6 +604,18 @@ impl HashChains {
             base: 0,
             next_hash3: 0,
             next_hash4: 0,
+            dirty: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        if self.dirty {
+            self.hash3_heads.fill(NO_POSITION);
+            self.hash4_heads.fill(NO_POSITION);
+            self.base = 0;
+            self.next_hash3 = 0;
+            self.next_hash4 = 0;
+            self.dirty = false;
         }
     }
 
@@ -471,7 +629,7 @@ impl HashChains {
     /// The position of `pos` relative to the window, sliding it first if needed.
     #[inline]
     fn relative(&mut self, pos: usize) -> usize {
-        if pos - self.base == WINDOW_SIZE {
+        if pos - self.base >= WINDOW_SIZE {
             self.slide_window();
         }
         pos - self.base
@@ -717,12 +875,14 @@ struct Sequence {
     literals: u32,
     length: u32,
     offset: u32,
-    offset_slot: usize,
+    offset_slot: u8,
 }
 
-/// How a level parses: which strategy, how deeply it searches, and what match ends a search.
-#[derive(Clone, Copy)]
+/// How a level parses: stored, fast hash table, greedy, lazy, or two-step lazy.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Parser {
+    Store,
+    Fast,
     Greedy,
     Lazy,
     Lazy2,
@@ -734,68 +894,249 @@ struct Precode {
     codewords: [u32; NUM_PRECODE_SYMS],
     lens: [u8; NUM_PRECODE_SYMS],
     /// Each item: a precode symbol, with its extra bits above bit 5.
-    items: Vec<u32>,
+    items: [u32; MAX_HEADER_LENS],
+    num_items: usize,
     num_litlen: usize,
     num_offset: usize,
     num_explicit_lens: usize,
 }
 
-struct Compressor {
+fn level_params(level: Level) -> (Parser, u32, u32) {
+    match level.get() {
+        0 => (Parser::Store, 0, 0),
+        1 => (Parser::Fast, 2, 32),
+        2 => (Parser::Greedy, 6, 10),
+        3 => (Parser::Greedy, 12, 14),
+        4 => (Parser::Greedy, 16, 30),
+        5 => (Parser::Lazy, 16, 30),
+        6 => (Parser::Lazy, 35, 65),
+        7 => (Parser::Lazy, 100, 130),
+        8 => (Parser::Lazy2, 300, MAX_MATCH_LEN),
+        _ => (Parser::Lazy2, 600, MAX_MATCH_LEN),
+    }
+}
+
+#[inline]
+fn store_cutoff(level: Level) -> usize {
+    match level.get() {
+        0 => usize::MAX,
+        l => 55 - 4 * usize::from(l),
+    }
+}
+
+/// A reusable DEFLATE, zlib, and gzip compressor (`libdeflate_compressor`).
+///
+/// Reusing a `Compressor` across multiple inputs avoids reallocating the matchfinder and
+/// sequence buffers on each call while producing the exact same output as the top-level
+/// functions.
+pub struct Compressor {
+    level: Level,
     parser: Parser,
     max_search_depth: u32,
     nice_match_len: u32,
     freqs: Frequencies,
     splitter: BlockSplitter,
     codes: Codes,
-    fixed_codes: Codes,
     precode: Precode,
     /// The codeword of every match length with its extra bits, and its total length.
     length_codewords: [u32; MAX_MATCH_LEN as usize + 1],
     length_codeword_lens: [u32; MAX_MATCH_LEN as usize + 1],
-    chains: HashChains,
+    fast_ht: Option<FastHashTable>,
+    chains: Option<HashChains>,
     sequences: Vec<Sequence>,
     /// The sequence being built.
     current: usize,
 }
 
+impl core::fmt::Debug for Compressor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Compressor")
+            .field("level", &self.level)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Compressor {
+    fn default() -> Self {
+        Self::new(Level::DEFAULT)
+    }
+}
+
 impl Compressor {
-    fn new(level: Level) -> Self {
-        let (parser, max_search_depth, nice_match_len) = match level.get() {
-            2 => (Parser::Greedy, 6, 10),
-            3 => (Parser::Greedy, 12, 14),
-            4 => (Parser::Greedy, 16, 30),
-            5 => (Parser::Lazy, 16, 30),
-            6 => (Parser::Lazy, 35, 65),
-            7 => (Parser::Lazy, 100, 130),
-            8 => (Parser::Lazy2, 300, MAX_MATCH_LEN),
-            _ => (Parser::Lazy2, 600, MAX_MATCH_LEN),
-        };
-        Compressor {
+    /// Creates a reusable compressor configured for `level` (`libdeflate_alloc_compressor`).
+    #[must_use]
+    pub fn new(level: Level) -> Self {
+        let (parser, max_search_depth, nice_match_len) = level_params(level);
+        let mut compressor = Compressor {
+            level,
             parser,
             max_search_depth,
             nice_match_len,
             freqs: Frequencies::default(),
             splitter: BlockSplitter::default(),
             codes: Codes::EMPTY,
-            fixed_codes: Codes::fixed(),
             precode: Precode {
                 freqs: [0; NUM_PRECODE_SYMS],
                 codewords: [0; NUM_PRECODE_SYMS],
                 lens: [0; NUM_PRECODE_SYMS],
-                items: Vec::new(),
+                items: [0; MAX_HEADER_LENS],
+                num_items: 0,
                 num_litlen: 0,
                 num_offset: 0,
                 num_explicit_lens: 0,
             },
             length_codewords: [0; MAX_MATCH_LEN as usize + 1],
             length_codeword_lens: [0; MAX_MATCH_LEN as usize + 1],
-            chains: HashChains::new(),
-            sequences: vec![Sequence::default(); MAX_SEQUENCES + 1],
+            fast_ht: None,
+            chains: None,
+            sequences: Vec::new(),
             current: 0,
+        };
+        compressor.ensure_buffers();
+        compressor
+    }
+
+    /// Returns the compression level currently configured on this compressor.
+    #[must_use]
+    pub const fn level(&self) -> Level {
+        self.level
+    }
+
+    /// Changes the compression level used by subsequent calls, retaining any working buffers
+    /// already allocated.
+    pub fn set_level(&mut self, level: Level) {
+        let (parser, max_search_depth, nice_match_len) = level_params(level);
+        self.level = level;
+        self.parser = parser;
+        self.max_search_depth = max_search_depth;
+        self.nice_match_len = nice_match_len;
+        self.ensure_buffers();
+    }
+
+    fn ensure_buffers(&mut self) {
+        match self.parser {
+            Parser::Store => {}
+            Parser::Fast => {
+                if self.fast_ht.is_none() {
+                    self.fast_ht = Some(FastHashTable::new());
+                }
+                if self.sequences.is_empty() {
+                    self.sequences = vec![Sequence::default(); MAX_SEQUENCES + 1];
+                }
+            }
+            Parser::Greedy | Parser::Lazy | Parser::Lazy2 => {
+                if self.chains.is_none() {
+                    self.chains = Some(HashChains::new());
+                }
+                if self.sequences.is_empty() {
+                    self.sequences = vec![Sequence::default(); MAX_SEQUENCES + 1];
+                }
+            }
         }
     }
 
-    fn compress(&mut self, input: &[u8], output: &mut BitWriter) {
+    /// Compresses `input` to a raw DEFLATE stream (`libdeflate_deflate_compress`).
+    #[must_use]
+    pub fn deflate_compress(&mut self, input: &[u8]) -> Vec<u8> {
+        let out = Vec::with_capacity(deflate_compress_bound(input.len()));
+        let Ok(out) = self.deflate_to_sink(input, out);
+        out
+    }
+
+    /// Compresses `input` as a raw DEFLATE stream into `output`, returning the number of bytes
+    /// written (`libdeflate_deflate_compress`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InsufficientSpace`] if the compressed stream does not fit in `output`.
+    pub fn deflate_compress_into(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        Ok(self.deflate_to_sink(input, SliceSink::new(output))?.pos)
+    }
+
+    /// Compresses `input` to a zlib stream (`libdeflate_zlib_compress`).
+    #[must_use]
+    pub fn zlib_compress(&mut self, input: &[u8]) -> Vec<u8> {
+        let out = Vec::with_capacity(zlib_compress_bound(input.len()));
+        let Ok(out) = self.zlib_to_sink(input, out);
+        out
+    }
+
+    /// Compresses `input` as a zlib stream into `output`, returning the number of bytes
+    /// written (`libdeflate_zlib_compress`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InsufficientSpace`] if the compressed stream does not fit in `output`.
+    pub fn zlib_compress_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize, Error> {
+        Ok(self.zlib_to_sink(input, SliceSink::new(output))?.pos)
+    }
+
+    /// Compresses `input` to an RFC 1952 gzip stream (`libdeflate_gzip_compress`).
+    #[must_use]
+    pub fn gzip_compress(&mut self, input: &[u8]) -> Vec<u8> {
+        let out = Vec::with_capacity(gzip_compress_bound(input.len()));
+        let Ok(out) = self.gzip_to_sink(input, out);
+        out
+    }
+
+    /// Compresses `input` as an RFC 1952 gzip stream into `output`, returning the number of
+    /// bytes written (`libdeflate_gzip_compress`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InsufficientSpace`] if the compressed stream does not fit in `output`.
+    pub fn gzip_compress_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize, Error> {
+        Ok(self.gzip_to_sink(input, SliceSink::new(output))?.pos)
+    }
+
+    fn deflate_to_sink<S: ByteSink>(&mut self, input: &[u8], mut sink: S) -> Result<S, S::Error> {
+        if input.len() <= store_cutoff(self.level) {
+            store_to_sink(input, &mut sink)?;
+            return Ok(sink);
+        }
+        let mut writer = BitWriter::new(sink);
+        self.compress_blocks(input, &mut writer)?;
+        writer.finish()
+    }
+
+    fn zlib_to_sink<S: ByteSink>(&mut self, input: &[u8], mut sink: S) -> Result<S, S::Error> {
+        sink.extend(&zlib_header(self.level))?;
+        let mut sink = self.deflate_to_sink(input, sink)?;
+        sink.extend(&adler32(input).to_be_bytes())?;
+        Ok(sink)
+    }
+
+    fn gzip_to_sink<S: ByteSink>(&mut self, input: &[u8], mut sink: S) -> Result<S, S::Error> {
+        sink.extend(&gzip_header(self.level))?;
+        let mut sink = self.deflate_to_sink(input, sink)?;
+        sink.extend(&crc32(input).to_le_bytes())?;
+        sink.extend(&(input.len() as u32).to_le_bytes())?;
+        Ok(sink)
+    }
+
+    fn compress_blocks<S: ByteSink>(
+        &mut self,
+        input: &[u8],
+        output: &mut BitWriter<S>,
+    ) -> Result<(), S::Error> {
+        match self.parser {
+            Parser::Store => return store_to_sink(input, &mut output.sink),
+            Parser::Fast => {
+                let ht = self.fast_ht.get_or_insert_with(FastHashTable::new);
+                ht.reset();
+                ht.dirty = true;
+            }
+            Parser::Greedy | Parser::Lazy | Parser::Lazy2 => {
+                let chains = self.chains.get_or_insert_with(HashChains::new);
+                chains.reset();
+                chains.dirty = true;
+            }
+        }
+
         let end = input.len();
         let mut pos = 0;
         let mut limits = MatchLimits::new(self.nice_match_len);
@@ -807,15 +1148,20 @@ impl Compressor {
                 pos + SOFT_MAX_BLOCK_LENGTH
             };
             self.begin_block();
-            let mut min_len =
-                initial_min_match_len(&input[pos..block_limit], self.max_search_depth);
+            let mut min_len = if self.parser == Parser::Fast {
+                4
+            } else {
+                initial_min_match_len(&input[pos..block_limit], self.max_search_depth)
+            };
             let mut next_min_len_update = pos + (end - pos).min(10_000);
             loop {
-                if !matches!(self.parser, Parser::Greedy) && pos >= next_min_len_update {
+                if matches!(self.parser, Parser::Lazy | Parser::Lazy2) && pos >= next_min_len_update
+                {
                     min_len = updated_min_match_len(&self.freqs, self.max_search_depth);
                     next_min_len_update += (end - next_min_len_update).min(pos - block_start);
                 }
                 pos = match self.parser {
+                    Parser::Store | Parser::Fast => self.parse_fast(input, pos, &mut limits),
                     Parser::Greedy => self.parse_greedy(input, pos, min_len, &mut limits),
                     Parser::Lazy | Parser::Lazy2 => {
                         self.parse_lazy(input, pos, min_len, &mut limits)
@@ -826,11 +1172,12 @@ impl Compressor {
                     break;
                 }
             }
-            self.finish_block(output, &input[block_start..pos], pos == end);
+            self.finish_block(output, &input[block_start..pos], pos == end)?;
             if pos == end {
                 break;
             }
         }
+        Ok(())
     }
 
     fn begin_block(&mut self) {
@@ -838,6 +1185,63 @@ impl Compressor {
         self.sequences[0] = Sequence::default();
         self.splitter = BlockSplitter::default();
         self.freqs = Frequencies::default();
+    }
+
+    /// One step of fast hash-table parsing (level 1) at `pos`.
+    fn parse_fast(&mut self, input: &[u8], pos: usize, limits: &mut MatchLimits) -> usize {
+        let remaining = input.len() - pos;
+        if remaining < 5 {
+            self.choose_literal(input[pos]);
+            return pos + 1;
+        }
+        limits.shrink_near_end(remaining);
+        let (best_len, best_at) = {
+            let ht = self.fast_ht.get_or_insert_with(FastHashTable::new);
+            let cur = ht.relative(pos);
+            let cutoff = (cur as u32).wrapping_sub(WINDOW_SIZE as u32) as i16;
+            let seq = load_u32(input, pos);
+            let h = hash(seq, HT_HASH_BITS) as usize;
+            let [first, second] = ht.entries[h];
+            ht.entries[h] = [cur as i16, first];
+
+            let mut best_len = 0u32;
+            let mut best_at = pos;
+            if first > cutoff {
+                let at = (ht.base as isize + isize::from(first)) as usize;
+                if load_u32(input, at) == seq {
+                    best_len = match_len(input, pos, at, 4, limits.max_len);
+                    best_at = at;
+                }
+            }
+            if best_len < limits.nice_len && second > cutoff {
+                let at = (ht.base as isize + isize::from(second)) as usize;
+                if load_u32(input, at) == seq {
+                    let len = match_len(input, pos, at, 4, limits.max_len);
+                    if len > best_len {
+                        best_len = len;
+                        best_at = at;
+                    }
+                }
+            }
+            if best_len >= 4 {
+                let next_end = pos + best_len as usize;
+                if next_end + 4 <= input.len() {
+                    ht.insert(input, pos + 1);
+                    if best_len >= 8 {
+                        ht.insert(input, next_end - 1);
+                    }
+                }
+            }
+            (best_len, best_at)
+        };
+
+        if best_len >= 4 {
+            self.choose_match(best_len, (pos - best_at) as u32);
+            pos + best_len as usize
+        } else {
+            self.choose_literal(input[pos]);
+            pos + 1
+        }
     }
 
     /// One step of greedy parsing at `pos`: the longest match, or a literal. Returns the next
@@ -851,10 +1255,11 @@ impl Compressor {
     ) -> usize {
         limits.shrink_near_end(input.len() - pos);
         let search = limits.search(min_len - 1, self.max_search_depth);
-        let (length, offset) = self.chains.longest_match(input, pos, search);
+        let chains = self.chains.get_or_insert_with(HashChains::new);
+        let (length, offset) = chains.longest_match(input, pos, search);
         if length >= min_len && (length > MIN_MATCH_LEN || offset <= 4096) {
+            chains.skip(input, pos + 1, length - 1);
             self.choose_match(length, offset);
-            self.chains.skip(input, pos + 1, length - 1);
             pos + length as usize
         } else {
             self.choose_literal(input[pos]);
@@ -874,7 +1279,10 @@ impl Compressor {
         let end = input.len();
         limits.shrink_near_end(end - pos);
         let search = limits.search(min_len - 1, self.max_search_depth);
-        let (mut cur_len, mut cur_offset) = self.chains.longest_match(input, pos, search);
+        let (mut cur_len, mut cur_offset) = self
+            .chains
+            .get_or_insert_with(HashChains::new)
+            .longest_match(input, pos, search);
         if cur_len < min_len || (cur_len == MIN_MATCH_LEN && cur_offset > 8192) {
             self.choose_literal(input[pos]);
             return pos + 1;
@@ -890,13 +1298,18 @@ impl Compressor {
         loop {
             if cur_len >= limits.nice_len {
                 self.choose_match(cur_len, cur_offset);
-                self.chains.skip(input, pos, cur_len - 1);
+                self.chains
+                    .get_or_insert_with(HashChains::new)
+                    .skip(input, pos, cur_len - 1);
                 return pos + cur_len as usize - 1;
             }
 
             limits.shrink_near_end(end - pos);
             let search = limits.search(cur_len - 1, self.max_search_depth >> 1);
-            let (next_len, next_offset) = self.chains.longest_match(input, pos, search);
+            let (next_len, next_offset) = self
+                .chains
+                .get_or_insert_with(HashChains::new)
+                .longest_match(input, pos, search);
             pos += 1;
             if beats(next_len, next_offset, cur_len, cur_offset, 2) {
                 self.choose_literal(input[pos - 2]);
@@ -904,15 +1317,20 @@ impl Compressor {
                 continue;
             }
 
-            if matches!(self.parser, Parser::Lazy) {
+            if self.parser == Parser::Lazy {
                 self.choose_match(cur_len, cur_offset);
-                self.chains.skip(input, pos, cur_len - 2);
+                self.chains
+                    .get_or_insert_with(HashChains::new)
+                    .skip(input, pos, cur_len - 2);
                 return pos + cur_len as usize - 2;
             }
 
             limits.shrink_near_end(end - pos);
             let search = limits.search(cur_len - 1, self.max_search_depth >> 2);
-            let (next_len, next_offset) = self.chains.longest_match(input, pos, search);
+            let (next_len, next_offset) = self
+                .chains
+                .get_or_insert_with(HashChains::new)
+                .longest_match(input, pos, search);
             pos += 1;
             if beats(next_len, next_offset, cur_len, cur_offset, 6) {
                 self.choose_literal(input[pos - 3]);
@@ -922,7 +1340,9 @@ impl Compressor {
             }
             self.choose_match(cur_len, cur_offset);
             if cur_len > 3 {
-                self.chains.skip(input, pos, cur_len - 3);
+                self.chains
+                    .get_or_insert_with(HashChains::new)
+                    .skip(input, pos, cur_len - 3);
                 pos += cur_len as usize - 3;
             }
             return pos;
@@ -938,7 +1358,7 @@ impl Compressor {
     fn choose_match(&mut self, length: u32, offset: u32) {
         let slot = offset_slot(offset);
         self.freqs.litlen[FIRST_LENGTH_SYM + usize::from(LENGTH_SLOTS[length as usize])] += 1;
-        self.freqs.offset[slot] += 1;
+        self.freqs.offset[usize::from(slot)] += 1;
         self.splitter.observe_match(length);
         let sequence = &mut self.sequences[self.current];
         sequence.length = length;
@@ -949,20 +1369,26 @@ impl Compressor {
     }
 
     /// Builds the block's codes and writes it, `data` being its input.
-    fn finish_block(&mut self, output: &mut BitWriter, data: &[u8], is_final: bool) {
+    fn finish_block<S: ByteSink>(
+        &mut self,
+        output: &mut BitWriter<S>,
+        data: &[u8],
+        is_final: bool,
+    ) -> Result<(), S::Error> {
         self.freqs.litlen[END_OF_BLOCK] += 1;
         self.codes.rebuild(&self.freqs);
-        self.write_block(output, data, is_final);
+        self.write_block(output, data, is_final)
     }
 
-    /// Run-length codes the first `num_lens` codeword lengths, in `lens`, for the header.
+    /// Run-length codes the codeword lengths in `lens` for the header.
     fn compute_precode_items(&mut self, lens: &[u8]) {
         let precode = &mut self.precode;
         precode.freqs = [0; NUM_PRECODE_SYMS];
-        precode.items.clear();
+        precode.num_items = 0;
         let mut emit = |symbol: usize, extra: usize| {
             precode.freqs[symbol] += 1;
-            precode.items.push(symbol as u32 | ((extra as u32) << 5));
+            precode.items[precode.num_items] = symbol as u32 | ((extra as u32) << 5);
+            precode.num_items += 1;
         };
         let mut start = 0;
         while start < lens.len() {
@@ -1014,11 +1440,11 @@ impl Compressor {
             .iter()
             .rposition(|&l| l != 0)
             .map_or(0, |i| i + 1);
-        // The header lists both sets of lengths back to back.
-        let mut listed = Vec::with_capacity(num_litlen + num_offset);
-        listed.extend_from_slice(&lens[..num_litlen]);
-        listed.extend_from_slice(&offset_lens[..num_offset]);
-        self.compute_precode_items(&listed);
+        // The header lists both sets of lengths back to back on the stack.
+        let mut listed = [0u8; MAX_HEADER_LENS];
+        listed[..num_litlen].copy_from_slice(&lens[..num_litlen]);
+        listed[num_litlen..num_litlen + num_offset].copy_from_slice(&offset_lens[..num_offset]);
+        self.compute_precode_items(&listed[..num_litlen + num_offset]);
 
         let precode = &mut self.precode;
         let freqs = precode.freqs;
@@ -1036,7 +1462,7 @@ impl Compressor {
             .map_or(0, |i| i + 1);
     }
 
-    /// The cost in bits of the block as dynamic, static and stored blocks.
+    /// The cost in bits of the block as dynamic, static, and stored blocks.
     fn block_costs(&self, bits_pending: u32, block_length: usize) -> [u32; 3] {
         let precode = &self.precode;
         let mut dynamic = 3 + 5 + 5 + 4 + 3 * precode.num_explicit_lens as u32;
@@ -1056,8 +1482,7 @@ impl Compressor {
             let freq = self.freqs.litlen[symbol];
             dynamic =
                 dynamic.wrapping_add(freq.wrapping_mul(extra + self.codes.litlen_len(symbol)));
-            fixed =
-                fixed.wrapping_add(freq.wrapping_mul(extra + self.fixed_codes.litlen_len(symbol)));
+            fixed = fixed.wrapping_add(freq.wrapping_mul(extra + FIXED_CODES.litlen_len(symbol)));
         }
         for (slot, &extra) in OFFSET_EXTRA_BITS.iter().enumerate() {
             let freq = self.freqs.offset[slot];
@@ -1066,7 +1491,7 @@ impl Compressor {
         }
         // A stored block: its 3 header bits, padding to a byte, then 4 bytes of length per
         // 65535 bytes of data.
-        let stored_blocks = block_length.div_ceil(MAX_STORED_LEN) as u32;
+        let stored_blocks = block_length.div_ceil(MAX_STORED_LEN).max(1) as u32;
         let stored = 3
             + ((bits_pending + 3).wrapping_neg() & 7)
             + 32
@@ -1076,79 +1501,76 @@ impl Compressor {
     }
 
     /// Writes the block of `data` as whichever kind of block is smallest.
-    fn write_block(&mut self, output: &mut BitWriter, data: &[u8], is_final: bool) {
+    fn write_block<S: ByteSink>(
+        &mut self,
+        output: &mut BitWriter<S>,
+        data: &[u8],
+        is_final: bool,
+    ) -> Result<(), S::Error> {
         self.prepare_dynamic_header();
         let [dynamic, fixed, stored] = self.block_costs(output.count, data.len());
         let best = dynamic.min(fixed.min(stored));
 
         if best == stored {
-            write_stored_blocks(output, data, is_final);
-            return;
+            return write_stored_blocks(output, data, is_final);
         }
         let use_fixed = best == fixed;
-        output.write(u32::from(is_final), 1);
+        output.write(u32::from(is_final), 1)?;
         if use_fixed {
-            output.write(1, 2);
+            output.write(1, 2)?;
         } else {
-            output.write(2, 2);
-            self.write_dynamic_header(output);
+            output.write(2, 2)?;
+            self.write_dynamic_header(output)?;
         }
         self.compute_length_codewords(use_fixed);
-        let codes = if use_fixed {
-            &self.fixed_codes
-        } else {
-            &self.codes
-        };
+        let codes = if use_fixed { &FIXED_CODES } else { &self.codes };
 
         let mut pos = 0;
         for sequence in &self.sequences[..=self.current] {
             for &literal in &data[pos..pos + sequence.literals as usize] {
                 let literal = usize::from(literal);
-                output.write(codes.litlen_codewords[literal], codes.litlen_len(literal));
+                output.write(codes.litlen_codewords[literal], codes.litlen_len(literal))?;
             }
             pos += sequence.literals as usize;
             if sequence.length == 0 {
                 break;
             }
             let length = sequence.length as usize;
-            let slot = sequence.offset_slot;
+            let slot = usize::from(sequence.offset_slot);
             output.write(
                 self.length_codewords[length],
                 self.length_codeword_lens[length],
-            );
-            output.write(codes.offset_codewords[slot], codes.offset_len(slot));
-            output.write(sequence.offset - OFFSET_BASE[slot], OFFSET_EXTRA_BITS[slot]);
+            )?;
+            output.write(codes.offset_codewords[slot], codes.offset_len(slot))?;
+            output.write(sequence.offset - OFFSET_BASE[slot], OFFSET_EXTRA_BITS[slot])?;
             pos += length;
         }
         output.write(
             codes.litlen_codewords[END_OF_BLOCK],
             codes.litlen_len(END_OF_BLOCK),
-        );
+        )
     }
 
-    fn write_dynamic_header(&self, output: &mut BitWriter) {
+    fn write_dynamic_header<S: ByteSink>(&self, output: &mut BitWriter<S>) -> Result<(), S::Error> {
         let precode = &self.precode;
-        output.write(precode.num_litlen as u32 - 257, 5);
-        output.write(precode.num_offset as u32 - 1, 5);
-        output.write(precode.num_explicit_lens as u32 - 4, 4);
+        output.write(precode.num_litlen as u32 - 257, 5)?;
+        output.write(precode.num_offset as u32 - 1, 5)?;
+        output.write(precode.num_explicit_lens as u32 - 4, 4)?;
         for &symbol in &PRECODE_ORDER[..precode.num_explicit_lens] {
-            output.write(u32::from(precode.lens[symbol]), 3);
+            output.write(u32::from(precode.lens[symbol]), 3)?;
         }
-        for &item in &precode.items {
+        for &item in &precode.items[..precode.num_items] {
             let symbol = (item & 0x1F) as usize;
-            output.write(precode.codewords[symbol], u32::from(precode.lens[symbol]));
-            output.write(item >> 5, PRECODE_EXTRA_BITS[symbol]);
+            output.write(precode.codewords[symbol], u32::from(precode.lens[symbol]))?;
+            output.write(item >> 5, PRECODE_EXTRA_BITS[symbol])?;
         }
+        Ok(())
     }
 
     /// Precomputes, for every match length, its length symbol's codeword followed by its
     /// extra bits.
     fn compute_length_codewords(&mut self, use_fixed: bool) {
-        let codes = if use_fixed {
-            &self.fixed_codes
-        } else {
-            &self.codes
-        };
+        let codes = if use_fixed { &FIXED_CODES } else { &self.codes };
         for len in MIN_MATCH_LEN..=MAX_MATCH_LEN {
             let slot = usize::from(LENGTH_SLOTS[len as usize]);
             let symbol = FIRST_LENGTH_SYM + slot;
@@ -1161,88 +1583,61 @@ impl Compressor {
     }
 }
 
-/// Writes `data` as stored blocks of at most 65535 bytes, after the bits already pending.
-fn write_stored_blocks(output: &mut BitWriter, data: &[u8], is_final: bool) {
-    let count = data.len().div_ceil(MAX_STORED_LEN).max(1);
-    for (k, chunk) in data.chunks(MAX_STORED_LEN).enumerate() {
-        let last = is_final && k + 1 == count;
-        // The block header joins the pending bits, then everything is padded to a byte.
-        let header = (u32::from(last) << output.count) | output.buffer as u32;
-        output.bytes.push(header as u8);
-        if output.count > 5 {
-            output.bytes.push(0);
-        }
-        output.buffer = 0;
-        output.count = 0;
-        let len = chunk.len() as u16;
-        output.bytes.extend_from_slice(&len.to_le_bytes());
-        output.bytes.extend_from_slice(&(!len).to_le_bytes());
-        output.bytes.extend_from_slice(chunk);
+fn write_one_stored_block<S: ByteSink>(
+    output: &mut BitWriter<S>,
+    chunk: &[u8],
+    is_final: bool,
+) -> Result<(), S::Error> {
+    // The block header joins the pending bits, then everything is padded to a byte.
+    let header = (u32::from(is_final) << output.count) | output.buffer as u32;
+    output.sink.push(header as u8)?;
+    if output.count > 5 {
+        output.sink.push(0)?;
     }
+    output.buffer = 0;
+    output.count = 0;
+    let len = chunk.len() as u16;
+    output.sink.extend(&len.to_le_bytes())?;
+    output.sink.extend(&(!len).to_le_bytes())?;
+    output.sink.extend(chunk)
 }
 
-/// Level 0: `input` as stored blocks, as `deflate_compress_none` writes them.
-fn store(input: &[u8], output: &mut Vec<u8>) {
+/// Writes `data` as stored blocks of at most 65,535 bytes, after the bits already pending.
+fn write_stored_blocks<S: ByteSink>(
+    output: &mut BitWriter<S>,
+    data: &[u8],
+    is_final: bool,
+) -> Result<(), S::Error> {
+    if data.is_empty() {
+        return write_one_stored_block(output, &[], is_final);
+    }
+    let count = data.len().div_ceil(MAX_STORED_LEN);
+    for (k, chunk) in data.chunks(MAX_STORED_LEN).enumerate() {
+        write_one_stored_block(output, chunk, is_final && k + 1 == count)?;
+    }
+    Ok(())
+}
+
+/// Level 0 and short-input stored blocks (`deflate_compress_none`).
+fn store_to_sink<S: ByteSink>(input: &[u8], output: &mut S) -> Result<(), S::Error> {
     if input.is_empty() {
         // A single, final, empty stored block.
-        output.push(1);
-        output.extend_from_slice(&0xFFFF_0000u32.to_le_bytes());
-        return;
+        output.push(1)?;
+        return output.extend(&0xFFFF_0000u32.to_le_bytes());
     }
     let count = input.len().div_ceil(MAX_STORED_LEN);
     for (k, chunk) in input.chunks(MAX_STORED_LEN).enumerate() {
         let len = chunk.len() as u16;
-        output.push(u8::from(k + 1 == count));
-        output.extend_from_slice(&len.to_le_bytes());
-        output.extend_from_slice(&(!len).to_le_bytes());
-        output.extend_from_slice(chunk);
+        output.push(u8::from(k + 1 == count))?;
+        output.extend(&len.to_le_bytes())?;
+        output.extend(&(!len).to_le_bytes())?;
+        output.extend(chunk)?;
     }
+    Ok(())
 }
 
-/// Appends `input` compressed as a raw DEFLATE stream to `output`.
-fn deflate_into(input: &[u8], level: Level, output: Vec<u8>) -> Vec<u8> {
-    // Short inputs are stored: libdeflate's cutoff falls as the level rises.
-    let store_up_to = match level.get() {
-        0 => usize::MAX,
-        l => 55 - 4 * usize::from(l),
-    };
-    if input.len() <= store_up_to {
-        let mut output = output;
-        store(input, &mut output);
-        return output;
-    }
-    let mut writer = BitWriter::new(output);
-    Compressor::new(level).compress(input, &mut writer);
-    writer.finish()
-}
-
-/// The largest raw DEFLATE stream [`deflate_compress`] can produce from `len` bytes, at any
-/// level (`libdeflate_deflate_compress_bound`).
-#[must_use]
-pub fn deflate_compress_bound(len: usize) -> usize {
-    // Five bytes for each stored block (at least one), and the data.
-    let max_blocks = len.div_ceil(MIN_BLOCK_LENGTH).max(1);
-    (5 * max_blocks).saturating_add(len)
-}
-
-/// The largest zlib stream [`zlib_compress`] can produce from `len` bytes, at any level
-/// (`libdeflate_zlib_compress_bound`).
-#[must_use]
-pub fn zlib_compress_bound(len: usize) -> usize {
-    // A 2-byte header and a 4-byte checksum.
-    deflate_compress_bound(len).saturating_add(2 + 4)
-}
-
-/// Compresses `input` to a raw DEFLATE stream at `level` (`libdeflate_deflate_compress`).
-#[must_use]
-pub fn deflate_compress(input: &[u8], level: Level) -> Vec<u8> {
-    deflate_into(input, level, Vec::new())
-}
-
-/// Compresses `input` to a zlib stream at `level` (`libdeflate_zlib_compress`): a 2-byte
-/// header, the raw DEFLATE stream, and the Adler-32 checksum of `input`.
-#[must_use]
-pub fn zlib_compress(input: &[u8], level: Level) -> Vec<u8> {
+#[inline]
+fn zlib_header(level: Level) -> [u8; 2] {
     let level_hint: u16 = match level.get() {
         0..2 => 0,
         2..6 => 1,
@@ -1253,11 +1648,126 @@ pub fn zlib_compress(input: &[u8], level: Level) -> Vec<u8> {
     // a multiple of 31.
     let mut header: u16 = (8 << 8) | (7 << 12) | (level_hint << 6);
     header |= 31 - header % 31;
-    let mut output = Vec::with_capacity(zlib_compress_bound(input.len()));
-    output.extend_from_slice(&header.to_be_bytes());
-    let mut output = deflate_into(input, level, output);
-    output.extend_from_slice(&adler32(input).to_be_bytes());
-    output
+    header.to_be_bytes()
+}
+
+#[inline]
+fn gzip_header(level: Level) -> [u8; 10] {
+    let xfl = match level.get() {
+        0..2 => 0x04, // fastest compression
+        8.. => 0x02,  // slowest compression
+        _ => 0x00,
+    };
+    [0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, xfl, 0xFF]
+}
+
+fn deflate_one_shot<S: ByteSink>(input: &[u8], level: Level, mut sink: S) -> Result<S, S::Error> {
+    if input.len() <= store_cutoff(level) {
+        store_to_sink(input, &mut sink)?;
+        return Ok(sink);
+    }
+    Compressor::new(level).deflate_to_sink(input, sink)
+}
+
+/// The largest raw DEFLATE stream [`deflate_compress`] can produce from `len` bytes, at any
+/// level (`libdeflate_deflate_compress_bound`).
+#[must_use]
+pub const fn deflate_compress_bound(len: usize) -> usize {
+    // Five bytes for each stored block (at least one), and the data.
+    let blocks = len.div_ceil(MIN_BLOCK_LENGTH);
+    let max_blocks = if blocks == 0 { 1 } else { blocks };
+    5usize.saturating_mul(max_blocks).saturating_add(len)
+}
+
+/// The largest zlib stream [`zlib_compress`] can produce from `len` bytes, at any level
+/// (`libdeflate_zlib_compress_bound`).
+#[must_use]
+pub const fn zlib_compress_bound(len: usize) -> usize {
+    // A 2-byte header and a 4-byte Adler-32 checksum.
+    deflate_compress_bound(len).saturating_add(2 + 4)
+}
+
+/// The largest gzip stream [`gzip_compress`] can produce from `len` bytes, at any level
+/// (`libdeflate_gzip_compress_bound`).
+#[must_use]
+pub const fn gzip_compress_bound(len: usize) -> usize {
+    // A 10-byte header and an 8-byte trailer (CRC-32 and input size modulo 2^32).
+    deflate_compress_bound(len).saturating_add(10 + 8)
+}
+
+/// Compresses `input` to a raw DEFLATE stream at `level` (`libdeflate_deflate_compress`).
+#[must_use]
+pub fn deflate_compress(input: &[u8], level: Level) -> Vec<u8> {
+    let out = Vec::with_capacity(deflate_compress_bound(input.len()));
+    let Ok(out) = deflate_one_shot(input, level, out);
+    out
+}
+
+/// Compresses `input` as a raw DEFLATE stream into `output` at `level`, returning the number
+/// of bytes written (`libdeflate_deflate_compress`).
+///
+/// # Errors
+///
+/// [`Error::InsufficientSpace`] if the compressed stream does not fit in `output`.
+pub fn deflate_compress_into(
+    input: &[u8],
+    output: &mut [u8],
+    level: Level,
+) -> Result<usize, Error> {
+    Ok(deflate_one_shot(input, level, SliceSink::new(output))?.pos)
+}
+
+/// Compresses `input` to a zlib stream at `level` (`libdeflate_zlib_compress`): a 2-byte
+/// header, the raw DEFLATE stream, and the Adler-32 checksum of `input`.
+#[must_use]
+pub fn zlib_compress(input: &[u8], level: Level) -> Vec<u8> {
+    let mut out = Vec::with_capacity(zlib_compress_bound(input.len()));
+    out.extend_from_slice(&zlib_header(level));
+    let Ok(mut out) = deflate_one_shot(input, level, out);
+    out.extend_from_slice(&adler32(input).to_be_bytes());
+    out
+}
+
+/// Compresses `input` as a zlib stream into `output` at `level`, returning the number of
+/// bytes written (`libdeflate_zlib_compress`).
+///
+/// # Errors
+///
+/// [`Error::InsufficientSpace`] if the compressed stream does not fit in `output`.
+pub fn zlib_compress_into(input: &[u8], output: &mut [u8], level: Level) -> Result<usize, Error> {
+    let mut sink = SliceSink::new(output);
+    sink.extend(&zlib_header(level))?;
+    let mut sink = deflate_one_shot(input, level, sink)?;
+    sink.extend(&adler32(input).to_be_bytes())?;
+    Ok(sink.pos)
+}
+
+/// Compresses `input` to an RFC 1952 gzip stream at `level` (`libdeflate_gzip_compress`): a
+/// 10-byte header, the raw DEFLATE stream, the CRC-32 checksum, and the input size modulo
+/// $2^{32}$.
+#[must_use]
+pub fn gzip_compress(input: &[u8], level: Level) -> Vec<u8> {
+    let mut out = Vec::with_capacity(gzip_compress_bound(input.len()));
+    out.extend_from_slice(&gzip_header(level));
+    let Ok(mut out) = deflate_one_shot(input, level, out);
+    out.extend_from_slice(&crc32(input).to_le_bytes());
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out
+}
+
+/// Compresses `input` as an RFC 1952 gzip stream into `output` at `level`, returning the
+/// number of bytes written (`libdeflate_gzip_compress`).
+///
+/// # Errors
+///
+/// [`Error::InsufficientSpace`] if the compressed stream does not fit in `output`.
+pub fn gzip_compress_into(input: &[u8], output: &mut [u8], level: Level) -> Result<usize, Error> {
+    let mut sink = SliceSink::new(output);
+    sink.extend(&gzip_header(level))?;
+    let mut sink = deflate_one_shot(input, level, sink)?;
+    sink.extend(&crc32(input).to_le_bytes())?;
+    sink.extend(&(input.len() as u32).to_le_bytes())?;
+    Ok(sink.pos)
 }
 
 #[cfg(test)]
@@ -1279,12 +1789,76 @@ mod tests {
                 .iter()
                 .rposition(|&base| base <= offset)
                 .unwrap();
-            assert_eq!(offset_slot(offset), slot, "offset {offset}");
+            assert_eq!(usize::from(offset_slot(offset)), slot, "offset {offset}");
         }
     }
 
     #[test]
-    fn streams_round_trip() {
+    fn const_fixed_codes_match_dynamic_builder() {
+        let mut freqs = Frequencies::default();
+        for (symbol, freq) in freqs.litlen.iter_mut().enumerate() {
+            let len = match symbol {
+                144..=255 => 9,
+                256..=279 => 7,
+                _ => 8,
+            };
+            *freq = 1 << (9 - len);
+        }
+        freqs.offset = [1; NUM_OFFSET_SYMS];
+        let mut built = Codes::EMPTY;
+        built.rebuild(&freqs);
+        assert_eq!(FIXED_CODES, built);
+    }
+
+    #[test]
+    fn write_stored_blocks_handles_empty_data_with_pending_bits() {
+        for pending_count in 0..8u32 {
+            for is_final in [false, true] {
+                let mut writer = BitWriter::new(Vec::new());
+                if pending_count > 0 {
+                    writer
+                        .write((1u32 << pending_count) - 1, pending_count)
+                        .unwrap();
+                }
+                write_stored_blocks(&mut writer, &[], is_final).unwrap();
+                if !is_final {
+                    // Follow with a final empty stored block so the DEFLATE stream terminates.
+                    write_stored_blocks(&mut writer, b"ok", true).unwrap();
+                }
+                let bytes = writer.finish().unwrap();
+                // Skip any synthetic non-block prefix only when pending_count == 0; otherwise
+                // verify exact header alignment and length complement!
+                let expected_prefix_bytes = if pending_count > 5 { 2 } else { 1 };
+                assert!(bytes.len() >= expected_prefix_bytes + 4);
+                assert_eq!(
+                    &bytes[expected_prefix_bytes..expected_prefix_bytes + 4],
+                    &[0x00, 0x00, 0xFF, 0xFF],
+                    "pending_count={pending_count}, is_final={is_final}"
+                );
+                if pending_count == 0 {
+                    let mut out = [0u8; 8];
+                    let res = crate::deflate_decompress(&bytes, &mut out).unwrap();
+                    let expected: &[u8] = if is_final { b"" } else { b"ok" };
+                    assert_eq!(&out[..res.bytes_written], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hash_chains_relative_slides_when_past_window() {
+        let mut chains = HashChains::new();
+        chains.hash4_heads[0] = 100;
+        // Jumping past WINDOW_SIZE (e.g. after skipping a match near a window boundary)
+        // must slide rather than leave `cur >= WINDOW_SIZE`.
+        let rel = chains.relative(WINDOW_SIZE + 17);
+        assert_eq!(rel, 17);
+        assert_eq!(chains.base, WINDOW_SIZE);
+        assert_eq!(chains.hash4_heads[0], (100 - WINDOW_SIZE as i32) as i16);
+    }
+
+    #[test]
+    fn streams_round_trip_all_levels_and_reused_compressor() {
         let mut state = 7u64;
         let data: Vec<u8> = (0..200_000u32)
             .map(|i| {
@@ -1298,17 +1872,25 @@ mod tests {
                 }
             })
             .collect();
-        for level in [0, 2, 3, 4, 5, 6, 7, 8, 9].map(|l| Level::new(l).unwrap()) {
-            for len in [0, 1, 30, 100, 5000, 70_000, 200_000] {
-                let stream = zlib_compress(&data[..len], level);
+
+        let mut reusable = Compressor::new(Level::L0);
+        for raw_level in 0..=9 {
+            let level = Level::new(raw_level).unwrap();
+            reusable.set_level(level);
+            assert_eq!(reusable.level(), level);
+            for len in [0, 1, 30, 52, 100, 5000, 33_020, 70_000, 200_000] {
+                let slice = &data[..len];
+                let stream = zlib_compress(slice, level);
                 assert!(stream.len() <= zlib_compress_bound(len));
+                assert_eq!(reusable.zlib_compress(slice), stream);
+
                 let mut back = vec![0; len];
                 let result = crate::zlib_decompress(&stream, &mut back).unwrap();
                 assert_eq!(
                     (result.bytes_read, result.bytes_written),
                     (stream.len(), len)
                 );
-                assert_eq!(back, &data[..len], "level {}, {len} bytes", level.get());
+                assert_eq!(back, slice, "level {raw_level}, {len} bytes");
             }
         }
     }

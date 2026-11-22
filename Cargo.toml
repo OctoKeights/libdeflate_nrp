@@ -1,6 +1,6 @@
 [package]
 name = "libdeflate_nrp"
-description = "DEFLATE and zlib compression in pure, safe Rust: a native port of libdeflate, bit-identical to it at levels 0 and 2 to 9."
+description = "DEFLATE, zlib, and gzip compression in pure, safe Rust: a native port of libdeflate, bit-identical to it at levels 0 and 2 to 9."
 version = "0.2.1"
 edition = "2024"
 rust-version = "1.100"
@@ -8,9 +8,13 @@ license = "MIT"
 repository = "https://github.com/OctoKeights/libdeflate_nrp"
 readme = "README.md"
 keywords = ["deflate", "zlib", "compression", "libdeflate", "inflate"]
-categories = ["compression"]
+categories = ["compression", "no-std"]
+exclude = [".github/", "compare/", "clippy.toml", "rust-toolchain.toml"]
 
 [dependencies]
+
+[profile.test]
+opt-level = 2
 
 [lints.rust]
 # No unsafe code in the library, its tests, examples or benchmarks.

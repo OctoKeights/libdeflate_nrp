@@ -21,7 +21,6 @@ fn main() {
         eprintln!("usage: dump <what> <seed> <count>   (see the top of dump.rs)");
         std::process::exit(2);
     };
-    let _ = seed;
     if what.as_str() == "libdeflate" {
         print!("{}", made_up::libdeflate(seed, count));
     } else {

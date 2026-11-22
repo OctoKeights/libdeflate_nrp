@@ -1,6 +1,6 @@
 # libdeflate_nrp
 
-**DEFLATE and zlib compression in pure, safe Rust, bit-identical to libdeflate.**
+**DEFLATE, zlib, and gzip compression in pure, safe `#![no_std]` Rust, bit-identical to libdeflate.**
 
 **Overview** · [Guide](docs/guide.md) · [Verification](docs/verification.md) · [Performance](docs/performance.md)
 
@@ -8,18 +8,21 @@
 
 libdeflate_nrp is a native Rust port of Eric Biggers's
 [libdeflate](https://github.com/ebiggers/libdeflate) v1.26. Its compressor produces the
-same streams as libdeflate, byte for byte, at levels 0 and 2 to 9, and its decompressor
-accepts and rejects exactly the streams libdeflate does.
+same streams as libdeflate, byte for byte, at levels 0 and 2 to 9 (plus a fast hash-table
+level 1), and its decompressor accepts and rejects the same streams libdeflate does.
 
 ## Highlights
 
-- **Bit-identical output.** Every stream matches libdeflate's at the same level, which
-  matters for formats that store libdeflate's output, such as OpenEXR's DWA compression.
+- **Bit-identical output.** Every stream at levels 0 and 2 to 9 matches libdeflate's at the
+  same level, which matters for formats that store libdeflate's output, such as OpenEXR's
+  DWA compression.
 
-- **Exact decompression.** Valid streams decompress to the same bytes, and damaged ones
-  fail with the same error.
+- **Exact, zero-allocation decompression.** Valid streams decompress to the same bytes, and
+  damaged ones fail with the same error, using compact two-level inline tables with zero
+  heap allocations.
 
-- **Zero dependencies.** Standard library only: no C compiler, no build script.
+- **Zero dependencies & `#![no_std]`.** Uses `core` and `alloc` only: no C compiler, no
+  build script.
 
 - **No `unsafe` code.** Enforced by `#![forbid(unsafe_code)]`.
 
@@ -52,9 +55,10 @@ assert_eq!(zlib_decompress(&stream, &mut short), Err(Error::InsufficientSpace));
 
 ## Scope
 
-Raw DEFLATE and zlib streams, both ways, with the Adler-32 checksum. Compression levels 0
-and 2 to 9 are ported; libdeflate's level 1 and its near-optimal levels 10 to 12 are not,
-and `Level` cannot represent them. gzip streams and CRC-32 are not ported.
+Raw DEFLATE, zlib, and RFC 1952 gzip streams in both directions, with Adler-32 and CRC-32
+checksums, reusable `Compressor` and `Decompressor` types, slice-based `*_compress_into`,
+and bounded `*_decompress_vec` helpers. Compression levels 0 to 9 are supported; levels 10
+to 12 are not ported.
 
 For general-purpose zlib compression where libdeflate's exact output does not matter,
 [miniz_nrp](https://github.com/OctoKeights/miniz_nrp) is an alternative.
