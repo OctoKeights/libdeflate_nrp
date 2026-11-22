@@ -20,7 +20,7 @@ seeds=${3:-3}
 dumps=${4:-libdeflate}
 tmp=${TMPDIR:-/tmp}/libdeflate_nrp-compare
 mkdir -p "$tmp" || exit 2
-if ! [ -f "$source/libdeflate.h" ] && [ -f "$source/lib/deflate_compress.c" ]; then
+if [ ! -f "$source/libdeflate.h" ] || [ ! -f "$source/lib/deflate_compress.c" ]; then
     echo "$source does not look like checkout of libdeflate" >&2
     exit 2
 fi
