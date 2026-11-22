@@ -30,7 +30,7 @@ level 1), and its decompressor accepts and rejects the same streams libdeflate d
 
 ```toml
 [dependencies]
-libdeflate_nrp = "0.2"
+libdeflate_nrp = "0.3"
 ```
 
 ## Quick start
